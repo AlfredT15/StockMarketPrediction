@@ -4,4 +4,4 @@ The original repository of the SpaceTimerFormer created by Jake Grigsby and Yanj
 
 The following is my research into [Multivariate Time-series Forecasting on Stock Market Data](CSC_561_Final_Report.pdf)
 
-(CSC561_poster.png)
+![](CSC561_poster.png)
