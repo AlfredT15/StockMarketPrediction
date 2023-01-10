@@ -9,6 +9,8 @@ import numpy as np
 
 import spacetimeformer as stf
 
+from sam import SAM
+
 
 class Forecaster(pl.LightningModule, ABC):
     def __init__(
@@ -30,6 +32,8 @@ class Forecaster(pl.LightningModule, ABC):
             self.linear_model = stf.linear_model.LinearModel(linear_window)
         else:
             self.linear_model = lambda x: 0.0
+        if self.loss == "SAMnll" or self.loss == "SAMmse":
+            self.automatic_optimization = False
 
     def set_null_value(self, val: float) -> None:
         self.null_value = val
@@ -54,7 +58,7 @@ class Forecaster(pl.LightningModule, ABC):
         self, true: torch.Tensor, preds: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:
 
-        if self.loss == "mse":
+        if self.loss == "mse" or self.loss == "SAMmse":
             if isinstance(preds, Normal):
                 preds = preds.mean
             return F.mse_loss(mask * true, mask * preds)
@@ -62,9 +66,10 @@ class Forecaster(pl.LightningModule, ABC):
             if isinstance(preds, Normal):
                 preds = preds.mean
             return torch.abs((true - preds) * mask).mean()
-        elif self.loss == "nll":
+        elif self.loss == "nll" or self.loss == "SAMnll":
             assert isinstance(preds, Normal)
             return -(mask * preds.log_prob(true)).sum(-1).sum(-1).mean()
+            # return F.nll_loss(mask * true, mask * preds)
         else:
             raise ValueError(f"Unrecognized Loss Function : {self.loss}")
 
@@ -186,11 +191,21 @@ class Forecaster(pl.LightningModule, ABC):
         )
         time_mask = self.time_masked_idx if train else None
 
+        # first forward-backward pass
         loss, output, mask = self.compute_loss(
             batch=batch,
             time_mask=time_mask,
             forward_kwargs=kwargs,
         )
+        if self.loss == "SAMnll" or self.loss == "SAMmse":
+            optimizer = self.optimizers()
+            self.manual_backward(loss, optimizer)
+            optimizer.first_step(zero_grad=True)
+
+            # second forward-backward pass
+            loss_2 = self.compute_loss(batch)
+            self.manual_backward(loss_2, optimizer)
+            optimizer.second_step(zero_grad=True)
         *_, y_t = batch
         stats = self._compute_stats(mask * output, mask * y_t)
         stats["loss"] = loss
@@ -218,6 +233,7 @@ class Forecaster(pl.LightningModule, ABC):
 
     def validation_step_end(self, outs):
         self._log_stats("val", outs)
+        self.val_loss = outs["loss"].mean()
         return {"loss": outs["loss"].mean()}
 
     def test_step_end(self, outs):
@@ -226,6 +242,11 @@ class Forecaster(pl.LightningModule, ABC):
 
     def predict_step(self, batch, batch_idx):
         return self(*batch, **self.eval_step_forward_kwargs)
+    
+    def on_train_epoch_end(self) -> None:
+        lr_scheduler = self.lr_schedulers()
+        lr_scheduler.step(self.val_loss)
+        return super().on_train_epoch_end()
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -236,6 +257,8 @@ class Forecaster(pl.LightningModule, ABC):
             patience=3,
             factor=0.2,
         )
+        if self.loss == "SAMnll":
+            optimizer = SAM(self.parameters(),optimizer, lr=self.learning_rate, weight_decay=self.l2_coeff)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -252,5 +275,5 @@ class Forecaster(pl.LightningModule, ABC):
         parser.add_argument("--grad_clip_norm", type=float, default=0)
         parser.add_argument("--linear_window", type=int, default=0)
         parser.add_argument(
-            "--loss", type=str, default="mse", choices=["mse", "mae", "nll"]
+            "--loss", type=str, default="mse", choices=["mse", "mae", "nll", "SAMnll"]
         )
